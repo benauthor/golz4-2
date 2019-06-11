@@ -22,6 +22,7 @@ static int LZ4_decompress_safe_continue_and_memcpy(
 import "C"
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -101,7 +102,6 @@ type Writer struct {
 	lz4Stream        *C.LZ4_stream_t
 	dstBuffer        []byte
 	underlyingWriter io.Writer
-	count            int
 }
 
 // NewWriter creates a new Writer. Writes to
@@ -115,25 +115,19 @@ func NewWriter(w io.Writer) *Writer {
 
 }
 
-// Write writes a compressed form of src to the underlying io.Writer.
-func (w *Writer) Write(src []byte) (int, error) {
-	w.count += 1
-	if len(src) == 0 {
+// Write writes a compressed form of p to the underlying io.Writer.
+func (w *Writer) Write(p []byte) (int, error) {
+	if len(p) == 0 {
 		return 0, nil
 	}
 
-	var (
-		totalCompressedLen, cum int
-	)
-
-	b := batch(len(src), streamingBlockSize)
+	b := batch(len(p), streamingBlockSize)
 	lenBuf := make([]byte, 4)
 
 	for b.Next() {
 
-		inputBuf := src[b.Start:b.End]
+		inputBuf := p[b.Start:b.End]
 		inputBytes := len(inputBuf)
-		cum += inputBytes
 
 		compressedLen := C.LZ4_compress_fast_continue(
 			w.lz4Stream,
@@ -159,11 +153,9 @@ func (w *Writer) Write(src []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-
-		totalCompressedLen += int(compressedLen)
 	}
 
-	return totalCompressedLen, nil
+	return len(p), nil
 }
 
 // Close releases all the resources occupied by Writer.
@@ -215,9 +207,9 @@ func (r *reader) Close() error {
 	return nil
 }
 
-// Read decompresses `compressionBuffer` into `dst`.
-func (r *reader) Read(dst []byte) (int, error) {
-	if len(dst) == 0 || dst == nil {
+// Read decompresses `compressionBuffer` into p.
+func (r *reader) Read(p []byte) (int, error) {
+	if len(p) == 0 || p == nil {
 		return 0, nil
 	}
 	writeOffset := 0
@@ -226,24 +218,35 @@ func (r *reader) Read(dst []byte) (int, error) {
 	// C.LZ4_setStreamDecode(r.lz4Stream, nil, 0)
 	// we have leftover decompressed data from previous call
 	if r.decompOffset > 0 {
-		copied := copy(dst[writeOffset:], r.decompressedBuffer[r.decBufIndex][r.decompOffset:])
-		if len(dst) == copied {
+		copied := copy(p[writeOffset:], r.decompressedBuffer[r.decBufIndex][r.decompOffset:])
+
+		justWritten := r.decompressedBuffer[r.decBufIndex][r.decompOffset:]
+		fmt.Println("wrote leftover", len(justWritten), copied)
+		if bytes.Contains(justWritten, []byte("see me heave")) {
+			fmt.Println("leftover: a very palpable hit")
+		}
+		if len(p) == copied {
 			r.decompOffset += copied
 			if r.decompOffset == len(r.decompressedBuffer[r.decBufIndex]) {
 				r.decompOffset = 0
 				r.decBufIndex = (r.decBufIndex + 1) % 2
 			}
-			return len(dst), nil
+			return len(p), nil
 		}
+
 		r.decompOffset = 0
 		r.decBufIndex = (r.decBufIndex + 1) % 2
 		writeOffset += copied
 	}
 
 	for {
+		fmt.Println("read")
 		// Populate src
 		blockSize, err := r.readSize(r.underlyingReader)
 		if err != nil {
+			if err == io.EOF {
+				fmt.Println("here's our EOF")
+			}
 			return writeOffset, err
 		}
 
@@ -267,25 +270,30 @@ func (r *reader) Read(dst []byte) (int, error) {
 			C.int(len(readBuffer)),
 			C.int(len(r.decompressedBuffer[r.decBufIndex])),
 		))
-
 		if written <= 0 {
 			break
 		}
 
-		copied := copy(dst[writeOffset:], r.decompressedBuffer[r.decBufIndex][:written])
+		copied := copy(p[writeOffset:], r.decompressedBuffer[r.decBufIndex][:written])
+		fmt.Println("wrote after read", written, copied)
+
+		justWritten := r.decompressedBuffer[r.decBufIndex][:written]
+		if bytes.Contains(justWritten, []byte("see me heave")) {
+			fmt.Println("read: a very palpable hit")
+		}
 
 		switch {
 		// have some leftover data from the decompressedBuffer
 		case copied+r.decompOffset < len(r.decompressedBuffer[r.decBufIndex][:written]):
 			r.decompOffset += copied
-			return len(dst), nil
+			return len(p), nil
 		// have copied all from the decompressedBuffer
 		case copied+r.decompOffset == len(r.decompressedBuffer[r.decBufIndex][:written]):
 			r.decompOffset = 0
 			r.decBufIndex = (r.decBufIndex + 1) % 2
 		}
 		writeOffset += copied
-		if writeOffset == len(dst) {
+		if writeOffset == len(p) {
 			return writeOffset, nil
 		}
 
